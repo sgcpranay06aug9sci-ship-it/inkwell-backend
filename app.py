@@ -1,22 +1,50 @@
 """
-app.py — Inkwell backend
--------------------------
-A self-contained NLP engine (no external API keys, no heavy model downloads).
-Implements:
+app.py — Inkwell backend (v2: adds PDF and Photo/OCR upload support)
+----------------------------------------------------------------------
+Existing features:
   1. Sentence-level sentiment analysis (lexicon-based)
   2. Extractive summarization (word-frequency scoring)
   3. Keyword extraction (frequency-based, stopwords removed)
   4. Basic text statistics (word count, reading time)
 
-Run with:  python app.py
-Then open: http://127.0.0.1:5000
+New in this version:
+  5. PDF upload -> extract text -> run through the same analysis
+  6. Photo upload -> OCR (extract text from image) -> run through the same analysis
 """
 
 import re
+import io
 from collections import Counter
 from flask import Flask, request, jsonify
 
+from pypdf import PdfReader
+from PIL import Image
+import pytesseract
+
+from textblob import TextBlob
+from textblob.sentiments import NaiveBayesAnalyzer
+
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024  # 15 MB upload limit
+
+# ---------------------------------------------------------------
+# ML SENTIMENT MODEL (trained once at server startup, not per-request)
+# ---------------------------------------------------------------
+# This is a real trained Naive Bayes classifier from TextBlob, trained on
+# a labeled corpus of 2,000 movie reviews (nltk's `movie_reviews` corpus).
+# We train it once here so every request afterward is instant.
+print("Training ML sentiment model (one-time, ~5 seconds)...")
+ML_ANALYZER = NaiveBayesAnalyzer()
+TextBlob("warming up the model", analyzer=ML_ANALYZER).sentiment  # triggers training
+print("ML sentiment model ready.")
+
+
+def ml_sentiment(text):
+    """Real ML-based sentiment using a trained Naive Bayes classifier."""
+    result = TextBlob(text, analyzer=ML_ANALYZER).sentiment
+    confidence = round(max(result.p_pos, result.p_neg) * 100)
+    label = "positive" if result.classification == "pos" else "negative"
+    return {"label": label, "confidence": confidence}
 
 
 @app.after_request
@@ -26,6 +54,7 @@ def add_cors_headers(response):
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return response
+
 
 # ---------------------------------------------------------------
 # 1. STATIC RESOURCES (no downloads needed — everything is local)
@@ -68,7 +97,6 @@ crashed useless waste wasted worse worthless boring painful complain complaint
 # ---------------------------------------------------------------
 
 def split_sentences(text):
-    """Split text into sentences using punctuation boundaries."""
     text = text.strip()
     if not text:
         return []
@@ -77,12 +105,10 @@ def split_sentences(text):
 
 
 def tokenize(text):
-    """Lowercase word tokens, punctuation stripped."""
     return re.findall(r"[a-zA-Z']+", text.lower())
 
 
 def sentence_sentiment(sentence):
-    """Return (label, score) for a single sentence using lexicon lookup."""
     words = tokenize(sentence)
     pos = sum(1 for w in words if w in POSITIVE_WORDS)
     neg = sum(1 for w in words if w in NEGATIVE_WORDS)
@@ -97,12 +123,10 @@ def sentence_sentiment(sentence):
 
 
 def overall_sentiment(sentences_data):
-    """Aggregate sentence-level sentiment into one overall verdict."""
     if not sentences_data:
         return {"label": "neutral", "positive": 0, "negative": 0, "neutral": 0}
     counts = Counter(s["label"] for s in sentences_data)
     total = len(sentences_data)
-    # Majority vote, ties go to neutral
     if counts["positive"] > counts["negative"]:
         label = "positive"
     elif counts["negative"] > counts["positive"]:
@@ -118,7 +142,6 @@ def overall_sentiment(sentences_data):
 
 
 def extract_keywords(text, top_n=8):
-    """Return the most frequent meaningful words (stopwords removed)."""
     words = tokenize(text)
     filtered = [w for w in words if w not in STOPWORDS and len(w) > 2]
     counts = Counter(filtered)
@@ -126,7 +149,6 @@ def extract_keywords(text, top_n=8):
 
 
 def summarize(text, sentences, num_sentences=3):
-    """Extractive summary: score sentences by frequency of their meaningful words."""
     if len(sentences) <= num_sentences:
         return sentences
 
@@ -140,7 +162,6 @@ def summarize(text, sentences, num_sentences=3):
     for idx, sentence in enumerate(sentences):
         sentence_words = tokenize(sentence)
         score = sum(normalized.get(w, 0) for w in sentence_words)
-        # Slight boost for earlier sentences (often carry topic sentences)
         if idx == 0:
             score *= 1.2
         scored.append((idx, sentence, score))
@@ -154,7 +175,7 @@ def text_stats(text, sentences):
     words = tokenize(text)
     word_count = len(words)
     char_count = len(text)
-    reading_time_min = max(1, round(word_count / 200))  # avg reading speed
+    reading_time_min = max(1, round(word_count / 200))
     return {
         "words": word_count,
         "characters": char_count,
@@ -163,13 +184,110 @@ def text_stats(text, sentences):
     }
 
 
+def count_syllables(word):
+    """Rough syllable estimate: count vowel groups. Good enough for readability scoring."""
+    word = word.lower()
+    vowels = "aeiouy"
+    count = 0
+    prev_was_vowel = False
+    for ch in word:
+        is_vowel = ch in vowels
+        if is_vowel and not prev_was_vowel:
+            count += 1
+        prev_was_vowel = is_vowel
+    if word.endswith("e") and count > 1:
+        count -= 1
+    return max(1, count)
+
+
+def readability_score(text, words, sentences):
+    """
+    Flesch-Kincaid Grade Level — a standard, named readability formula:
+    0.39 * (words/sentences) + 11.8 * (syllables/words) - 15.59
+    Returns an approximate US school grade level needed to understand the text.
+    """
+    if not words or not sentences:
+        return {"grade_level": 0, "label": "N/A"}
+
+    syllable_count = sum(count_syllables(w) for w in words)
+    grade = 0.39 * (len(words) / len(sentences)) + 11.8 * (syllable_count / len(words)) - 15.59
+    grade = max(0, round(grade, 1))
+
+    if grade <= 6:
+        label = "Easy (elementary level)"
+    elif grade <= 9:
+        label = "Moderate (middle school level)"
+    elif grade <= 13:
+        label = "Difficult (high school / college level)"
+    else:
+        label = "Very difficult (graduate level)"
+
+    return {"grade_level": grade, "label": label}
+
+
+def word_frequencies(text, top_n=25):
+    """Word frequency data for the word cloud visualization."""
+    words = tokenize(text)
+    filtered = [w for w in words if w not in STOPWORDS and len(w) > 2]
+    counts = Counter(filtered)
+    return [{"word": w, "count": c} for w, c in counts.most_common(top_n)]
+
+
+def build_analysis(text):
+    """Shared analysis pipeline used by both the text endpoint and the file endpoint."""
+    sentences = split_sentences(text)
+    words = tokenize(text)
+    sentences_data = []
+    for s in sentences:
+        label, score = sentence_sentiment(s)
+        sentences_data.append({"text": s, "label": label, "score": score})
+
+    return {
+        "sentiment": overall_sentiment(sentences_data),
+        "ml_sentiment": ml_sentiment(text),
+        "sentences": sentences_data,
+        "keywords": extract_keywords(text),
+        "word_cloud": word_frequencies(text),
+        "summary": summarize(text, sentences),
+        "stats": text_stats(text, sentences),
+        "readability": readability_score(text, words, sentences),
+    }
+
+
 # ---------------------------------------------------------------
-# 3. ROUTES
+# 3. FILE TEXT EXTRACTION (NEW)
+# ---------------------------------------------------------------
+
+def extract_text_from_pdf(file_bytes):
+    reader = PdfReader(io.BytesIO(file_bytes))
+    text_parts = []
+    for page in reader.pages:
+        page_text = page.extract_text() or ""
+        text_parts.append(page_text)
+    return "\n".join(text_parts).strip()
+
+
+def extract_text_from_image(file_bytes):
+    image = Image.open(io.BytesIO(file_bytes))
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    text = pytesseract.image_to_string(image)
+    return text.strip()
+
+
+# ---------------------------------------------------------------
+# 4. ROUTES
 # ---------------------------------------------------------------
 
 @app.route("/")
 def home():
-    return jsonify({"status": "Inkwell backend is running", "endpoint": "/api/analyze (POST)"})
+    return jsonify({
+        "status": "Inkwell backend is running",
+        "endpoints": {
+            "/api/analyze": "POST { text } -> analysis",
+            "/api/analyze-file": "POST multipart file (pdf/png/jpg) -> analysis",
+        }
+    })
 
 
 @app.route("/api/analyze", methods=["POST"])
@@ -179,24 +297,51 @@ def analyze():
 
     if not text:
         return jsonify({"error": "Please enter some text to analyze."}), 400
-
     if len(text) > 20000:
         return jsonify({"error": "Text is too long. Please limit to 20,000 characters."}), 400
 
-    sentences = split_sentences(text)
+    result = build_analysis(text)
+    return jsonify(result)
 
-    sentences_data = []
-    for s in sentences:
-        label, score = sentence_sentiment(s)
-        sentences_data.append({"text": s, "label": label, "score": score})
 
-    result = {
-        "sentiment": overall_sentiment(sentences_data),
-        "sentences": sentences_data,
-        "keywords": extract_keywords(text),
-        "summary": summarize(text, sentences),
-        "stats": text_stats(text, sentences),
-    }
+@app.route("/api/analyze-file", methods=["POST"])
+def analyze_file():
+    if "file" not in request.files:
+        return jsonify({"error": "No file was uploaded."}), 400
+
+    file = request.files["file"]
+    filename = (file.filename or "").lower()
+
+    if not filename:
+        return jsonify({"error": "Uploaded file has no name."}), 400
+
+    file_bytes = file.read()
+
+    try:
+        if filename.endswith(".pdf"):
+            text = extract_text_from_pdf(file_bytes)
+        elif filename.endswith((".png", ".jpg", ".jpeg")):
+            text = extract_text_from_image(file_bytes)
+        else:
+            return jsonify({
+                "error": "Unsupported file type. Please upload a PDF, PNG, or JPG."
+            }), 400
+    except Exception:
+        return jsonify({
+            "error": "Could not read this file. It may be corrupted, password-protected, or an unsupported format."
+        }), 500
+
+    if not text or not text.strip():
+        return jsonify({
+            "error": "No readable text was found in this file. For scanned images, make sure the photo is clear and well-lit."
+        }), 400
+
+    if len(text) > 20000:
+        text = text[:20000]
+
+    result = build_analysis(text)
+    result["extracted_text"] = text
+    result["source_filename"] = file.filename
     return jsonify(result)
 
 

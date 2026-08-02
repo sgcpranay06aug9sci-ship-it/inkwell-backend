@@ -1,2 +1,7 @@
 Flask
+pypdf
+Pillow
+pytesseract
 gunicorn
+textblob
+nltk
