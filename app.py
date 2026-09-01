@@ -1,19 +1,35 @@
 """
-app.py — Inkwell backend (v2: adds PDF and Photo/OCR upload support)
+app.py — Inkwell backend (v4: adds large-PDF support, up to ~1000 pages)
 ----------------------------------------------------------------------
 Existing features:
   1. Sentence-level sentiment analysis (lexicon-based)
   2. Extractive summarization (word-frequency scoring)
   3. Keyword extraction (frequency-based, stopwords removed)
   4. Basic text statistics (word count, reading time)
+  5. ML sentiment (trained Naive Bayes), readability score, word cloud data
 
 New in this version:
-  5. PDF upload -> extract text -> run through the same analysis
-  6. Photo upload -> OCR (extract text from image) -> run through the same analysis
+  6. PDF text extraction is no longer truncated at 20,000 characters — the
+     whole document is used.
+  7. Large PDFs are summarized with a page-aware "map-reduce" extractive
+     method: the doc is split into chunks, each chunk's best sentences are
+     picked using that chunk's own word frequencies (so late pages aren't
+     drowned out by early ones), then the candidates are re-ranked globally
+     for the final summary. Every summary point is tagged with its page range.
+  8. Large PDFs (more than SYNC_PAGE_LIMIT pages) are processed in a
+     background thread and return a job_id right away (202 Accepted),
+     instead of blocking the request until it times out. Poll
+     GET /api/job-status/<job_id> for progress and the final result.
+  9. Small PDFs, images, and pasted text still return an instant synchronous
+     response, exactly as before — no changes needed on clients that don't
+     poll.
 """
 
 import re
 import io
+import time
+import uuid
+import threading
 from collections import Counter
 from flask import Flask, request, jsonify
 
@@ -25,7 +41,10 @@ from textblob import TextBlob
 from textblob.sentiments import NaiveBayesAnalyzer
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024  # 15 MB upload limit
+# Raised from 15MB -> 75MB so large (mostly-text) PDFs aren't rejected outright.
+# A 1000-page text PDF is usually 5-30MB. Tune this to your Render plan's
+# memory ceiling if you see out-of-memory errors on very large files.
+app.config["MAX_CONTENT_LENGTH"] = 75 * 1024 * 1024
 
 # ---------------------------------------------------------------
 # ML SENTIMENT MODEL (trained once at server startup, not per-request)
@@ -233,29 +252,185 @@ def word_frequencies(text, top_n=25):
     return [{"word": w, "count": c} for w, c in counts.most_common(top_n)]
 
 
-def build_analysis(text):
-    """Shared analysis pipeline used by both the text endpoint and the file endpoint."""
+def representative_sample(text, max_chars=20000):
+    """For very long documents, take evenly spaced slices across the WHOLE
+    text rather than just the beginning, so aggregate stats (ML sentiment,
+    keywords, word cloud) reflect the full document instead of only its
+    opening pages. Short text is returned unchanged."""
+    if len(text) <= max_chars:
+        return text
+    num_slices = 10
+    slice_size = max_chars // num_slices
+    step = len(text) // num_slices
+    parts = [text[i * step: i * step + slice_size] for i in range(num_slices)]
+    return "\n".join(parts)
+
+
+def build_analysis(text, pages_text=None, target_summary_sentences=12, sentence_display_limit=400):
+    """
+    Shared analysis pipeline used by the text endpoint and the file endpoint.
+
+    If `pages_text` (a list of per-page extracted text) is supplied, summarization
+    uses the page-aware hierarchical map-reduce method in hierarchical_summarize(),
+    which scales to very long documents and tags each summary point with a page
+    range. Otherwise the original single-pass word-frequency summarizer is used
+    (short PDFs, images, and pasted text) — unchanged behavior.
+    """
     sentences = split_sentences(text)
     words = tokenize(text)
+
     sentences_data = []
     for s in sentences:
         label, score = sentence_sentiment(s)
         sentences_data.append({"text": s, "label": label, "score": score})
 
+    overall = overall_sentiment(sentences_data)  # computed on the FULL sentence set, never sampled
+
+    # A 1000-page doc can have tens of thousands of sentences. Sending them all
+    # to a mobile client is wasted payload since the UI only ever shows a
+    # handful — ship an evenly-spaced sample instead, and report the true total.
+    if len(sentences_data) > sentence_display_limit:
+        step = len(sentences_data) / sentence_display_limit
+        sentences_display = [sentences_data[int(i * step)] for i in range(sentence_display_limit)]
+    else:
+        sentences_display = sentences_data
+
+    sample_text = representative_sample(text)
+
+    if pages_text is not None:
+        summary_result = hierarchical_summarize(pages_text, target_sentences=target_summary_sentences)
+        summary_detailed = summary_result["summary"]
+        summary_sentences = [item["text"] for item in summary_detailed]
+    else:
+        summary_sentences = summarize(text, sentences)
+        summary_detailed = [{"text": s, "pages": None} for s in summary_sentences]
+
     return {
-        "sentiment": overall_sentiment(sentences_data),
-        "ml_sentiment": ml_sentiment(text),
-        "sentences": sentences_data,
-        "keywords": extract_keywords(text),
-        "word_cloud": word_frequencies(text),
-        "summary": summarize(text, sentences),
+        "sentiment": overall,
+        "ml_sentiment": ml_sentiment(sample_text),
+        "sentences": sentences_display,
+        "sentences_total": len(sentences_data),
+        "keywords": extract_keywords(sample_text),
+        "word_cloud": word_frequencies(sample_text),
+        "summary": summary_sentences,
+        "summary_detailed": summary_detailed,
         "stats": text_stats(text, sentences),
         "readability": readability_score(text, words, sentences),
     }
 
 
 # ---------------------------------------------------------------
-# 3. FILE TEXT EXTRACTION (NEW)
+# 3. LONG-DOCUMENT SUMMARIZATION (map-reduce over pages, scales to ~1000 pages)
+# ---------------------------------------------------------------
+
+WORDS_PER_CHUNK = 2500   # roughly 6-8 pages per chunk depending on text density
+SYNC_PAGE_LIMIT = 8      # PDFs at/under this many pages use the old instant, synchronous path
+
+
+def build_word_freq(text):
+    words = tokenize(text)
+    filtered = [w for w in words if w not in STOPWORDS]
+    freq = Counter(filtered)
+    max_freq = max(freq.values()) if freq else 1
+    return {w: c / max_freq for w, c in freq.items()}
+
+
+def score_sentence(sentence, freq):
+    words = tokenize(sentence)
+    if not words:
+        return 0.0
+    # Mild length dampener so scoring doesn't just reward the longest sentence.
+    return sum(freq.get(w, 0) for w in words) / (len(words) ** 0.3)
+
+
+def chunk_pages(pages_text, words_per_chunk=WORDS_PER_CHUNK):
+    """Group consecutive pages into ~words_per_chunk-word chunks, remembering
+    which page range each chunk covers."""
+    chunks = []
+    current_text, current_word_count, start_page = [], 0, 1
+
+    for i, page_text in enumerate(pages_text, start=1):
+        current_text.append(page_text)
+        current_word_count += len(tokenize(page_text))
+
+        if current_word_count >= words_per_chunk or i == len(pages_text):
+            chunks.append({
+                "text": "\n".join(current_text),
+                "start_page": start_page,
+                "end_page": i,
+            })
+            current_text, current_word_count, start_page = [], 0, i + 1
+
+    return [c for c in chunks if c["text"].strip()]
+
+
+def hierarchical_summarize(pages_text, target_sentences=12):
+    """
+    Map-reduce extractive summarization for long documents:
+      1. Split the document into page-bounded chunks (~2,500 words each).
+      2. MAP: score every sentence in a chunk against THAT CHUNK's own word
+         frequencies and keep its best few — so a document's later pages get
+         a fair shot instead of being drowned out by whichever pages happen
+         to share the most common words.
+      3. REDUCE: re-score the surviving candidates against the document's
+         GLOBAL word frequencies and keep the overall best `target_sentences`,
+         restored to original document order.
+    Every kept sentence is tagged with the page range it came from.
+    """
+    full_text = "\n".join(pages_text)
+    chunks = chunk_pages(pages_text)
+    if not chunks:
+        return {"summary": [], "chunk_count": 0}
+
+    global_freq = build_word_freq(full_text)
+
+    # --- MAP step: pick local candidates from every chunk ---
+    # Selection is by SENTENCE INDEX, not sentence text — a document with
+    # repeated boilerplate (headers, disclaimers, recurring phrases) would
+    # otherwise have every occurrence of a matched sentence text swept in,
+    # letting one repeated line flood the final summary.
+    per_chunk_keep = max(2, (target_sentences // max(1, len(chunks))) + 1)
+    candidates = []  # (original_order, sentence_text, page_range_label)
+    order = 0
+    for chunk in chunks:
+        local_freq = build_word_freq(chunk["text"])
+        sentences = split_sentences(chunk["text"])
+        scored = [(i, s, score_sentence(s, local_freq)) for i, s in enumerate(sentences)]
+        top_indices = {i for i, s, sc in sorted(scored, key=lambda x: x[2], reverse=True)[:per_chunk_keep]}
+
+        page_range = (f"p.{chunk['start_page']}" if chunk["start_page"] == chunk["end_page"]
+                      else f"p.{chunk['start_page']}-{chunk['end_page']}")
+
+        for i, s in enumerate(sentences):
+            if i in top_indices:
+                candidates.append((order, s, page_range))
+                order += 1
+
+    # --- REDUCE step: re-rank all candidates document-wide, deduping any
+    # sentence text that recurred across multiple chunks (keep its best-scoring
+    # occurrence's page reference; drop the rest so the summary isn't repetitive) ---
+    rescored = sorted(
+        [(idx, s, pr, score_sentence(s, global_freq)) for idx, s, pr in candidates],
+        key=lambda x: x[3], reverse=True,
+    )
+    best, seen_text = [], set()
+    for item in rescored:
+        if item[1] in seen_text:
+            continue
+        seen_text.add(item[1])
+        best.append(item)
+        if len(best) >= target_sentences:
+            break
+    best_in_order = sorted(best, key=lambda x: x[0])
+
+    return {
+        "summary": [{"text": s, "pages": pr} for _, s, pr, _ in best_in_order],
+        "chunk_count": len(chunks),
+    }
+
+
+# ---------------------------------------------------------------
+# 4. FILE TEXT EXTRACTION
 # ---------------------------------------------------------------
 
 def extract_text_from_pdf(file_bytes):
@@ -276,7 +451,74 @@ def extract_text_from_image(file_bytes):
 
 
 # ---------------------------------------------------------------
-# 4. ROUTES
+# 5. BACKGROUND JOB QUEUE (in-memory — fine for a single-worker deployment)
+# ---------------------------------------------------------------
+# This dict lives in one process's memory. If you ever deploy with multiple
+# gunicorn workers (e.g. `gunicorn -w 4`), each worker has its own copy and a
+# client could poll a worker that never received their job. Keep this on a
+# single worker (Render's default), or swap this for Redis if you scale up.
+
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+JOB_TTL_SECONDS = 60 * 60  # purge finished jobs an hour after creation
+
+
+def _purge_old_jobs():
+    cutoff = time.time() - JOB_TTL_SECONDS
+    with JOBS_LOCK:
+        for jid in [j for j, v in JOBS.items() if v.get("created_at", 0) < cutoff]:
+            del JOBS[jid]
+
+
+def _run_pdf_job(job_id, file_bytes, source_filename):
+    try:
+        with JOBS_LOCK:
+            JOBS[job_id]["status"] = "extracting"
+
+        reader = PdfReader(io.BytesIO(file_bytes))
+        num_pages = len(reader.pages)
+        pages_text = []
+
+        for i, page in enumerate(reader.pages):
+            pages_text.append(page.extract_text() or "")
+            if i % 20 == 0 or i == num_pages - 1:
+                with JOBS_LOCK:
+                    JOBS[job_id]["progress"] = {
+                        "stage": "extracting", "pages_done": i + 1, "pages_total": num_pages,
+                    }
+
+        full_text = "\n".join(pages_text).strip()
+
+        if not full_text:
+            with JOBS_LOCK:
+                JOBS[job_id]["status"] = "error"
+                JOBS[job_id]["error"] = (
+                    "No readable text was found in this PDF. It may be scanned "
+                    "images rather than real text — multi-page OCR isn't enabled "
+                    "in this version."
+                )
+            return
+
+        with JOBS_LOCK:
+            JOBS[job_id]["status"] = "summarizing"
+            JOBS[job_id]["progress"] = {"stage": "summarizing", "pages_total": num_pages}
+
+        result = build_analysis(full_text, pages_text=pages_text)
+        result["source_filename"] = source_filename
+        result["page_count"] = num_pages
+
+        with JOBS_LOCK:
+            JOBS[job_id]["status"] = "done"
+            JOBS[job_id]["result"] = result
+
+    except Exception as e:
+        with JOBS_LOCK:
+            JOBS[job_id]["status"] = "error"
+            JOBS[job_id]["error"] = f"Failed to process PDF: {e}"
+
+
+# ---------------------------------------------------------------
+# 6. ROUTES
 # ---------------------------------------------------------------
 
 @app.route("/")
@@ -285,7 +527,9 @@ def home():
         "status": "Inkwell backend is running",
         "endpoints": {
             "/api/analyze": "POST { text } -> analysis",
-            "/api/analyze-file": "POST multipart file (pdf/png/jpg) -> analysis",
+            "/api/analyze-file": "POST multipart file (pdf/png/jpg) -> analysis, "
+                                  "or { job_id } (202) for PDFs over 8 pages",
+            "/api/job-status/<job_id>": "GET -> { status, progress, result? } for large-PDF jobs",
         }
     })
 
@@ -317,32 +561,80 @@ def analyze_file():
 
     file_bytes = file.read()
 
-    try:
-        if filename.endswith(".pdf"):
-            text = extract_text_from_pdf(file_bytes)
-        elif filename.endswith((".png", ".jpg", ".jpeg")):
-            text = extract_text_from_image(file_bytes)
-        else:
+    if filename.endswith(".pdf"):
+        try:
+            reader = PdfReader(io.BytesIO(file_bytes))
+            num_pages = len(reader.pages)
+        except Exception:
             return jsonify({
-                "error": "Unsupported file type. Please upload a PDF, PNG, or JPG."
-            }), 400
-    except Exception:
+                "error": "Could not read this PDF. It may be corrupted or password-protected."
+            }), 500
+
+        if num_pages > SYNC_PAGE_LIMIT:
+            # Large PDF (this is what makes 1000-page documents possible): hand it
+            # off to a background thread and return a job id immediately instead
+            # of blocking the request until it times out.
+            _purge_old_jobs()
+            job_id = str(uuid.uuid4())
+            with JOBS_LOCK:
+                JOBS[job_id] = {
+                    "status": "queued",
+                    "progress": {"stage": "queued", "pages_total": num_pages},
+                    "result": None,
+                    "error": None,
+                    "created_at": time.time(),
+                }
+            threading.Thread(target=_run_pdf_job, args=(job_id, file_bytes, file.filename), daemon=True).start()
+            return jsonify({
+                "job_id": job_id,
+                "status": "queued",
+                "page_count": num_pages,
+                "message": "Large PDF received — poll /api/job-status/<job_id> for progress.",
+            }), 202
+
+        # Small PDF (8 pages or fewer): process synchronously, same as before.
+        try:
+            text = "\n".join((p.extract_text() or "") for p in reader.pages).strip()
+        except Exception:
+            return jsonify({
+                "error": "Could not read this file. It may be corrupted, password-protected, or an unsupported format."
+            }), 500
+
+    elif filename.endswith((".png", ".jpg", ".jpeg")):
+        try:
+            text = extract_text_from_image(file_bytes)
+        except Exception:
+            return jsonify({
+                "error": "Could not read this file. It may be corrupted, password-protected, or an unsupported format."
+            }), 500
+    else:
         return jsonify({
-            "error": "Could not read this file. It may be corrupted, password-protected, or an unsupported format."
-        }), 500
+            "error": "Unsupported file type. Please upload a PDF, PNG, or JPG."
+        }), 400
 
     if not text or not text.strip():
         return jsonify({
             "error": "No readable text was found in this file. For scanned images, make sure the photo is clear and well-lit."
         }), 400
 
-    if len(text) > 20000:
-        text = text[:20000]
-
     result = build_analysis(text)
     result["extracted_text"] = text
     result["source_filename"] = file.filename
     return jsonify(result)
+
+
+@app.route("/api/job-status/<job_id>", methods=["GET"])
+def job_status(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return jsonify({"error": "Unknown job id (it may have expired)."}), 404
+        response = {"status": job["status"], "progress": job.get("progress")}
+        if job["status"] == "done":
+            response["result"] = job["result"]
+        elif job["status"] == "error":
+            response["error"] = job["error"]
+    return jsonify(response)
 
 
 if __name__ == "__main__":
